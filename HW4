@@ -1,0 +1,236 @@
+library(shiny)
+library(shiny.fluent)
+library(tidyverse)
+library(caret)
+library(DALEX)
+library(gbm)
+library(rsconnect)
+
+student_performance <- read.csv("https://drive.google.com/uc?export=download&id=1heuzeQAzJhv1u2hRYCPnmrURdAQvdItF")
+
+student_performance_clean <- student_performance |>
+  mutate(across(
+    c(Gender, Parental_Involvement, School_Type, Peer_Influence, 
+      Learning_Disabilities, Parental_Education_Level, Access_to_Resources, 
+      Extracurricular_Activities, Motivation_Level, Internet_Access, Family_Income,
+      Teacher_Quality, Distance_from_Home), 
+    ~ replace_na(as.factor(.), "Unknown") 
+  )) |>
+  mutate(across(
+    c(Hours_Studied, Attendance, Previous_Scores, Tutoring_Sessions, Physical_Activity,
+      Sleep_Hours, Exam_Score), 
+    ~ replace_na(., median(., na.rm = TRUE)) 
+  )) |>
+  mutate(across(
+    c(Teacher_Quality, Parental_Education_Level, Distance_from_Home),
+    ~ fct_na_value_to_level(.x, "Unknown")
+  )) |>
+  mutate(Exam_Score = ifelse(Exam_Score > 100, 100, Exam_Score)) |>
+  mutate(Physical_Activity = replace_na(
+    Physical_Activity, as.integer(round(mean(Physical_Activity, na.rm = TRUE)))
+  )) |>
+  mutate(across(
+    c(Teacher_Quality, Parental_Education_Level, Distance_from_Home),
+    ~ fct_recode(.x, Unknown = "")
+  )) 
+
+x <- dplyr::select(student_performance_clean, -Exam_Score)
+hyper <- data.frame(n.trees = 100, interaction.depth = 8, shrinkage = 0.1, n.minobsinnode = 10)
+fit <- train(x = x, y = student_performance_clean$Exam_Score, method = "gbm", tuneGrid = hyper, verbose = FALSE)
+
+gbm_importance <- summary(fit$finalModel, plotit = FALSE)
+summary(fit$finalModel)
+explanation <- explain(model = fit, data = x, y = student_performance_clean$Exam_Score)
+
+numeric_vars<- student_performance_clean |>
+  select(where(is.numeric))
+factor_vars <- student_performance_clean |>
+  select(where(is.factor)) |>
+  mutate(across(everything(), as.character)) |>
+  mutate(across(everything(), ~as.numeric(factor(.))))
+all_vars <- bind_cols(numeric_vars, factor_vars)
+correlation_matrix <- cor(all_vars, use = "complete.obs")
+correlation_data <- reshape2::melt(correlation_matrix)
+
+ui <- fluidPage(
+  h1("Student Performance Analysis", align = "center"),
+  tabsetPanel(
+    tabPanel("Interactive Plots",
+             sidebarLayout(
+               sidebarPanel(
+                 selectInput("cp_variable", "Select Variable for CP Plot:",
+                             choices = c("Attendance", "Hours_Studied", "Sleep_Hours", "Previous_Scores")),
+                 selectInput("group", "Group By (Optional):", 
+                             choices = c("None", 
+                                         colnames(student_performance_clean)[sapply(student_performance_clean, is.factor)]), 
+                             selected = "None"),
+                 actionButton("update_cp_plot", "Update CP Plot"),
+                 br(), br(),
+                 br(), br(),
+                 br(), br(),
+                 br(), br(),
+                 br(), br(),
+                 br(), br(),
+                 selectInput("pdp_variable", "Select Variable for PDP Plot:",
+                             choices = c("Attendance", "Hours_Studied", "Sleep_Hours", "Previous_Scores")),
+                 actionButton("update_pdp_plot", "Update PDP Plot")
+               ),
+               mainPanel(
+                 plotOutput("cp_plot_interactive"),
+                 br(), 
+                 plotOutput("pdp_plot_interactive")
+               )
+             )
+    ),
+    
+    tabPanel("Predict Exam Score",
+             fluidRow(
+               column(12,
+                      wellPanel(
+                        h3("Predicted Exam Score:"),
+                        verbatimTextOutput("predicted_score")
+                      )
+               )
+             ),
+             fluidRow(
+               column(6,
+                      wellPanel(
+                        h3("Enter Details:"),
+                        sliderInput("hours_studied", "Hours Studied:", min = 0, max = 30, value = 10),
+                        sliderInput("attendance", "Attendance (%):", min = 0, max = 100, value = 80),
+                        sliderInput("previous_scores", "Previous Scores:", min = 0, max = 100, value = 60),
+                        sliderInput("sleep_hours", "Sleep Hours:", min = 0, max = 12, value = 7),
+                        sliderInput("tutoring_sessions", "Tutoring Sessions:", min = 0, max = 10, value = 2),
+                        sliderInput("physical_activity", "Physical Activity (Hours):", min = 0, max = 8, value = 4)
+                      )
+               ),
+               column(6,
+                      wellPanel(
+                        selectInput("parental_involvement", "Parental Involvement:",
+                                    choices = c("Low", "Medium", "High"), selected = "Medium"),
+                        selectInput("access_to_resources", "Access to Resources:", 
+                                    choices = c("Low", "Medium", "High"), selected = "Medium"),
+                        selectInput("family_income", "Family Income:", 
+                                    choices = c("Low", "Medium", "High"), selected = "Medium")
+                      )
+               )
+             )),
+    
+    tabPanel("Feature Importance",
+             fluidRow(
+               column(12, 
+                      wellPanel(
+                        h3("Feature Importance from GBM Model"),
+                        textOutput("gbm_importance_text"),
+                        HTML('<p>You can find more information about the dataset at this link: <a href="https://wwww.kaggle.com/datasets/lainguyn123/student-performance-factors" target="_blank">Dataset Source</a></p>'),
+                        plotOutput("gbm_importance_plot", heigh = "600px")
+                      )
+               ),
+               column(12,
+                      wellPanel(
+                        h3("Correlation Heatmap"),
+                        textOutput("heatmap_text"),
+                        plotOutput("correlation_heatmap")
+                      )
+             )
+    )
+  )
+)
+)
+
+server <- function(input, output, session) {
+
+  default_cp_profile <- reactive({
+    model_profile(explainer = explanation, variables = "Attendance")
+  })
+  
+  default_pdp_profile <- reactive({
+    model_profile(explainer = explanation, variables = "Attendance")
+  })
+  
+  reactive_cp_plot <- eventReactive(input$update_cp_plot, {
+    if (input$group == "None") {
+      model_profile(explainer = explanation, variables = input$cp_variable)
+    } else {
+      model_profile(explainer = explanation, groups = input$group, variables = input$cp_variable)
+    }
+  }, ignoreInit = TRUE)
+  
+  output$cp_plot_interactive <- renderPlot({
+    profile <- if (is.null(input$update_cp_plot) || input$update_cp_plot == 0) {
+      default_cp_profile()
+    } else {
+      reactive_cp_plot()
+    }
+    plot(profile, geom = "profiles") + scale_color_brewer(palette = "Set2")
+  })
+  
+  reactive_pdp_plot <- eventReactive(input$update_pdp_plot, {
+    model_profile(explainer = explanation, variables = input$pdp_variable)
+  }, ignoreInit = TRUE)
+  
+  output$pdp_plot_interactive <- renderPlot({
+    profile <- if (is.null(input$update_pdp_plot) || input$update_pdp_plot == 0) {
+      default_pdp_profile()
+    } else {
+      reactive_pdp_plot()
+    }
+    plot(profile, geom = "aggregates") + scale_color_brewer(palette = "Set2")
+  })
+  
+  predict_score <- reactive({
+
+    new_data <- data.frame(
+      Hours_Studied = as.integer(input$hours_studied),
+      Attendance = as.integer(input$attendance),
+      Sleep_Hours = as.integer(input$sleep_hours),
+      Previous_Scores = as.integer(input$previous_scores),
+      Tutoring_Sessions = as.integer(input$tutoring_sessions),
+      Physical_Activity = as.integer(input$physical_activity),
+      Parental_Involvement = factor(input$parental_involvement, levels = unique(student_performance_clean$Parental_Involvement)),
+      Access_to_Resources = factor(input$access_to_resources, levels = unique(student_performance_clean$Access_to_Resources)),
+      Family_Income = factor(input$family_income, levels = unique(student_performance_clean$Family_Income)
+      ))
+    predict(fit, newdata = new_data)
+  })
+  
+  output$predicted_score <- renderPrint({
+    predict_score()
+  })
+
+output$gbm_importance_text <- renderText({
+  "The model was built using a machine learning technique called Gradient Boosting Machines (GBMs).
+    This method converts weak learner models into stronger ones.
+    GBMs train multiple models in a gradual, additive, and sequential manner. In the plot, you can see the variables
+    that had the greatest influence on predicting students' exam scores.
+    The relative importance of the top three variables in the model accounts for more than 70%. Therefore, we can conclude that 'Attendance', 
+    'Hours Studied', and 'Previous Scores' have a significant impact on exam performance.
+    On the other hand, variables such 'Gender', 'School Type', and 'Internet Access' showed very low importance in the model."
+})
+
+output$gbm_importance_plot <- renderPlot({
+  ggplot(gbm_importance, aes(x=reorder(var, -rel.inf), y=rel.inf)) +
+    geom_bar(stat="identity", fill = "skyblue") +
+    theme(axis.text.x=element_text(angle=45, hjust=1, size=12),
+          axis.title.x = element_blank(),
+          axis.title.y = element_text(size=14),
+          plot.title = element_text(size=16))+
+    ylab("Percentage explained")
+})
+
+output$heatmap_text <- renderText({
+  "The correlation heatmap was created by calculating the correlation coefficients between the variables and visualizing them using a color scale that indicate the strength of these relationship.
+  It highlights key interactions, with stronger correlations between 'Atendance' and 'Exam Score' as well as'Hours studied' and 'Exam Score', while 'Gender' and 'School Type' show little correlation with 'Exam Score'."
+})
+
+output$correlation_heatmap <- renderPlot({
+  ggplot(correlation_data, aes(Var1, Var2, fill=value))+
+    geom_tile(color = "white") +
+    scale_fill_gradient2(low= "blue", high="red", mid="white", midpoint=0, limit=c(-1,1), space="Lab") +
+    theme_minimal()+
+    theme(axis.text.x=element_text(angle=45, hjust=1)) +
+    labs(x="", y="", fill="Correlation")
+})
+}
+
+shinyApp(ui, server)
